@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """nginx / OpenResty live performance monitor (terminal TUI).
 
-Источники данных:
-  - access-логи nginx (latency, статусы, топ URL/IP)   -> --access-log
-  - stub_status (соединения)                            -> --status-url
-  - системные метрики хоста (CPU/RAM/диск/сеть)         -> psutil
+Data sources:
+  - nginx access logs (latency, statuses, top URL/IP)   -> --access-log
+  - stub_status (connections)                           -> --status-url
+  - host system metrics (CPU/RAM/disk/network)          -> psutil
 
-Обновляется раз в N секунд, считает перцентили по скользящему окну,
-показывает алерты при превышении порогов.
+Refreshes every N seconds, computes percentiles over a sliding window,
+shows alerts when thresholds are exceeded.
 
-Зависимости: rich, psutil  (pip install -r requirements.txt)
+Dependencies: rich, psutil  (pip install -r requirements.txt)
 """
 from __future__ import annotations
 
@@ -31,22 +31,22 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# ───────────────────────── парсинг лога ─────────────────────────
+# ───────────────────────── log parsing ─────────────────────────
 
-# поля из "perf"-формата:  ... rt=0.123 uct=0.001 uht=0.010 urt=0.110
+# fields from the "perf" format:  ... rt=0.123 uct=0.001 uht=0.010 urt=0.110
 _RT = re.compile(r"\brt=(\d+\.?\d*)")
 _URT = re.compile(r"\burt=(\d+\.?\d*|-)")
-# combined-часть: "GET /path HTTP/1.1" 200 1234
+# combined part: "GET /path HTTP/1.1" 200 1234
 _REQ = re.compile(r'"(?P<method>[A-Z]+)\s+(?P<uri>[^ "?]+)[^"]*"\s+(?P<status>\d{3})')
 _IP = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})")
 
 
 @dataclass
 class Event:
-    t: float            # момент чтения строки (≈ now для live tail)
+    t: float            # moment the line was read (≈ now for live tail)
     status: int
-    rt: float           # request_time, сек
-    urt: float          # upstream_response_time, сек (-1 если нет)
+    rt: float           # request_time, sec
+    urt: float          # upstream_response_time, sec (-1 if absent)
     uri: str
     ip: str
     bytes: int
@@ -64,7 +64,7 @@ def parse_line(line: str, now: float) -> Optional[Event]:
     line = line.strip()
     if not line:
         return None
-    # 1) JSON-формат (log_format ... escape=json '{...}')
+    # 1) JSON format (log_format ... escape=json '{...}')
     if line[0] == "{":
         try:
             d = json.loads(line)
@@ -79,14 +79,14 @@ def parse_line(line: str, now: float) -> Optional[Event]:
             ip=str(d.get("remote_addr", "?")),
             bytes=int(d.get("bytes", d.get("body_bytes_sent", 0)) or 0),
         )
-    # 2) текстовый perf-формат
+    # 2) plain-text perf format
     m = _REQ.search(line)
     if not m:
         return None
     rt_m = _RT.search(line)
     urt_m = _URT.search(line)
     ip_m = _IP.match(line)
-    # объём — число перед "$http_referer" сразу после статуса
+    # size — the number before "$http_referer", right after the status
     bytes_m = re.search(r'"\s+\d{3}\s+(\d+)', line)
     return Event(
         t=now,
@@ -100,7 +100,7 @@ def parse_line(line: str, now: float) -> Optional[Event]:
 
 
 class LogTailer:
-    """Инкрементальное чтение access-лога с учётом ротации."""
+    """Incremental access-log reading with rotation handling."""
 
     def __init__(self, path: str, from_start: bool = False):
         self.path = path
@@ -124,7 +124,7 @@ class LogTailer:
             self._open(seek_end=False)
             if self._fh is None:
                 return []
-        # обнаружить ротацию (файл пересоздан/усечён)
+        # detect rotation (file recreated/truncated)
         try:
             st = os.stat(self.path)
             if st.st_ino != self._inode or st.st_size < self._fh.tell():
@@ -138,7 +138,7 @@ class LogTailer:
         return lines
 
 
-# ───────────────────── агрегатор по скользящему окну ─────────────────────
+# ───────────────────── sliding-window aggregator ─────────────────────
 
 
 class Window:
@@ -201,7 +201,7 @@ def fetch_stub(url: str, timeout: float = 1.0) -> StubStatus:
     return s
 
 
-# ───────────────────────── система ─────────────────────────
+# ───────────────────────── system ─────────────────────────
 
 
 @dataclass
@@ -240,7 +240,7 @@ def sys_metrics(state: SysState) -> dict:
     return out
 
 
-# ───────────────────────── форматирование ─────────────────────────
+# ───────────────────────── formatting ─────────────────────────
 
 
 def human_bytes(n: float) -> str:
@@ -260,7 +260,7 @@ def bar(pct: float, width: int = 12, color: str = "green") -> Text:
     return Text("█" * filled + "▏" * (width - filled), style=color)
 
 
-# ───────────────────────── алерты ─────────────────────────
+# ───────────────────────── alerts ─────────────────────────
 
 
 @dataclass
@@ -287,7 +287,7 @@ def check_alerts(th: Thresholds, stats: dict, sysm: dict) -> list[str]:
     return a
 
 
-# ───────────────────────── рендер ─────────────────────────
+# ───────────────────────── render ─────────────────────────
 
 
 def compute_stats(win: Window) -> dict:
@@ -339,7 +339,7 @@ def header_panel(stats: dict, stub: StubStatus, win: Window, interval: int) -> P
         ("upstream      ", "bold dim"),
         (f"p50 {ms(stats['u_p50'])}  p95 {ms(stats['u_p95'])}", "dim"),
     )
-    sub = f"окно {win.window}s · обновление {interval}s · трафик {human_bytes(stats['bytes'])}"
+    sub = f"window {win.window}s · refresh {interval}s · traffic {human_bytes(stats['bytes'])}"
     body = Group(t, rt, up)
     return Panel(body, title="nginx monitor", subtitle=sub, border_style="cyan")
 
@@ -354,7 +354,7 @@ def slow_table(win: Window) -> Table:
         key=lambda x: x[1],
         reverse=True,
     )[:8]
-    t = Table(title="Топ медленных URL", expand=True, title_style="bold")
+    t = Table(title="Top slow URLs", expand=True, title_style="bold")
     t.add_column("URL", overflow="ellipsis", no_wrap=True)
     t.add_column("max", justify="right")
     t.add_column("n", justify="right")
@@ -362,13 +362,13 @@ def slow_table(win: Window) -> Table:
         c = "red" if mx > 1 else "yellow" if mx > 0.3 else "white"
         t.add_row(uri, Text(ms(mx), style=c), str(n))
     if not rows:
-        t.add_row("(нет данных)", "", "")
+        t.add_row("(no data)", "", "")
     return t
 
 
 def status_table(stats: dict) -> Table:
-    t = Table(title="Статусы", expand=True, title_style="bold")
-    t.add_column("код", justify="left")
+    t = Table(title="Statuses", expand=True, title_style="bold")
+    t.add_column("code", justify="left")
     t.add_column("", justify="left")
     t.add_column("%", justify="right")
     total = stats["total"] or 1
@@ -382,7 +382,7 @@ def status_table(stats: dict) -> Table:
 
 def sys_panel(sysm: dict) -> Panel:
     if not sysm:
-        return Panel(Text("системные метрики выключены", style="dim"), title="Система")
+        return Panel(Text("system metrics disabled", style="dim"), title="System")
     load = sysm.get("load", (0, 0, 0))
     t = Table.grid(expand=True)
     for _ in range(4):
@@ -404,12 +404,12 @@ def sys_panel(sysm: dict) -> Panel:
         Text.assemble(("net↓ ", "bold"), f"{human_bytes(sysm['net_down'])}/s"),
         Text.assemble(("net↑ ", "bold"), f"{human_bytes(sysm['net_up'])}/s"),
     )
-    return Panel(t, title="Система", border_style="blue")
+    return Panel(t, title="System", border_style="blue")
 
 
 def stub_line(stub: StubStatus) -> Text:
     if not stub.ok:
-        return Text(f"stub_status: недоступен ({stub.err})", style="dim red")
+        return Text(f"stub_status: unavailable ({stub.err})", style="dim red")
     rpc = stub.requests / stub.handled if stub.handled else 0
     dropped = stub.accepts - stub.handled
     return Text.assemble(
@@ -422,9 +422,9 @@ def stub_line(stub: StubStatus) -> Text:
 
 def alerts_panel(alerts: list[str]) -> Panel:
     if not alerts:
-        return Panel(Text("OK — порогов не превышено", style="green"), title="Алерты", border_style="green")
+        return Panel(Text("OK — no thresholds exceeded", style="green"), title="Alerts", border_style="green")
     body = Text("\n".join(f"⚠ {a}" for a in alerts), style="bold red")
-    return Panel(body, title="⚠ АЛЕРТЫ", border_style="red")
+    return Panel(body, title="⚠ ALERTS", border_style="red")
 
 
 def build_layout(stats, stub, sysm, alerts, win, interval) -> Layout:
@@ -449,26 +449,26 @@ def build_layout(stats, stub, sysm, alerts, win, interval) -> Layout:
 def main():
     ap = argparse.ArgumentParser(description="nginx/OpenResty live monitor")
     ap.add_argument("--access-log", default="/usr/local/openresty/nginx/logs/access.log",
-                    help="путь к access-логу")
+                    help="path to the access log")
     ap.add_argument("--status-url", default="http://127.0.0.1/nginx_status",
-                    help="URL stub_status (пусто — отключить)")
-    ap.add_argument("--interval", type=int, default=2, help="период обновления, сек")
-    ap.add_argument("--window", type=int, default=60, help="окно агрегации, сек")
-    ap.add_argument("--no-system", action="store_true", help="не показывать метрики хоста")
-    ap.add_argument("--from-start", action="store_true", help="читать лог с начала")
-    ap.add_argument("--bell", action="store_true", help="звук при алерте")
-    ap.add_argument("--th-5xx", type=float, default=1.0, help="порог %% 5xx")
-    ap.add_argument("--th-p99", type=float, default=1000.0, help="порог p99, мс")
-    ap.add_argument("--th-disk", type=float, default=90.0, help="порог %% диска")
-    ap.add_argument("--th-cpu", type=float, default=90.0, help="порог %% CPU")
-    ap.add_argument("--th-mem", type=float, default=90.0, help="порог %% RAM")
+                    help="stub_status URL (empty — disable)")
+    ap.add_argument("--interval", type=int, default=2, help="refresh period, sec")
+    ap.add_argument("--window", type=int, default=60, help="aggregation window, sec")
+    ap.add_argument("--no-system", action="store_true", help="hide host metrics")
+    ap.add_argument("--from-start", action="store_true", help="read log from the beginning")
+    ap.add_argument("--bell", action="store_true", help="beep on alert")
+    ap.add_argument("--th-5xx", type=float, default=1.0, help="5xx %% threshold")
+    ap.add_argument("--th-p99", type=float, default=1000.0, help="p99 threshold, ms")
+    ap.add_argument("--th-disk", type=float, default=90.0, help="disk %% threshold")
+    ap.add_argument("--th-cpu", type=float, default=90.0, help="CPU %% threshold")
+    ap.add_argument("--th-mem", type=float, default=90.0, help="RAM %% threshold")
     args = ap.parse_args()
 
     th = Thresholds(args.th_5xx, args.th_p99, args.th_disk, args.th_cpu, args.th_mem)
     win = Window(args.window)
     tailer = LogTailer(args.access_log, from_start=args.from_start)
     sysstate = SysState()
-    psutil.cpu_percent(interval=None)  # прайминг
+    psutil.cpu_percent(interval=None)  # priming
     sys_metrics(sysstate)
 
     with Live(refresh_per_second=4, screen=True) as live:
