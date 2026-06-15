@@ -33,7 +33,8 @@ Percentiles need `request_time` in the access log. Two formats are supported.
 log_format perf '$remote_addr - $remote_user [$time_local] "$request" '
                 '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
                 'rt=$request_time uct=$upstream_connect_time '
-                'uht=$upstream_header_time urt=$upstream_response_time';
+                'uht=$upstream_header_time urt=$upstream_response_time '
+                'cs=$upstream_cache_status';
 access_log /usr/local/openresty/nginx/logs/access.log perf;
 ```
 
@@ -57,10 +58,17 @@ log_format json_perf escape=json '{'
   '"request_time":$request_time,'
   '"upstream_connect_time":"$upstream_connect_time",'
   '"upstream_header_time":"$upstream_header_time",'
-  '"upstream_time":"$upstream_response_time"'
+  '"upstream_time":"$upstream_response_time",'
+  '"cache":"$upstream_cache_status"'
 '}';
 access_log /usr/local/openresty/nginx/logs/access.log json_perf;
 ```
+
+`upstream_header_time` is the backend TTFB (time to first response byte) — a
+server-side metric independent of the client/VPN network path. `upstream_cache_status`
+(`HIT`/`MISS`/`BYPASS`/…) lets the monitor split latency into cached vs uncached
+serving; without `proxy_cache` the field is always `-` and the cache line is hidden.
+Multi-upstream times (`0.01, 0.02 : 0.03`) are summed.
 
 `stub_status`:
 ```nginx
@@ -77,7 +85,9 @@ The parser reads these keys (extra keys are kept in the log but ignored):
 |---|---|
 | `status` | HTTP status code (number) |
 | `request_time` | total request time, seconds (drives p50–p99) |
+| `upstream_header_time` | backend TTFB, seconds (shown as upstream `ttfb`) |
 | `upstream_time` / `upstream_response_time` | backend time, seconds |
+| `cache` / `upstream_cache_status` | `HIT`/`MISS`/… → cached vs uncached latency split |
 | `uri` / `request` | URL for "top slow URLs" grouping |
 | `remote_addr` | client IP |
 | `bytes` / `body_bytes_sent` | response size |

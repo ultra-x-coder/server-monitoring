@@ -33,12 +33,18 @@ from rich.text import Text
 
 # ───────────────────────── log parsing ─────────────────────────
 
-# fields from the "perf" format:  ... rt=0.123 uct=0.001 uht=0.010 urt=0.110
+# fields from the "perf" format:  ... rt=0.123 uct=0.001 uht=0.010 urt=0.110 cs=HIT
 _RT = re.compile(r"\brt=(\d+\.?\d*)")
-_URT = re.compile(r"\burt=(\d+\.?\d*|-)")
+_UHT = re.compile(r"\buht=([\d.,:-]+)")
+_URT = re.compile(r"\burt=([\d.,:-]+)")
+_CS = re.compile(r"\bcs=([A-Za-z]+)")
 # combined part: "GET /path HTTP/1.1" 200 1234
 _REQ = re.compile(r'"(?P<method>[A-Z]+)\s+(?P<uri>[^ "?]+)[^"]*"\s+(?P<status>\d{3})')
 _IP = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})")
+
+# nginx $upstream_cache_status values
+_MISS_STATES = {"MISS", "EXPIRED", "STALE", "BYPASS", "REVALIDATED", "UPDATING"}
+_CACHE_STATES = {"HIT"} | _MISS_STATES
 
 
 @dataclass
@@ -46,7 +52,9 @@ class Event:
     t: float            # moment the line was read (≈ now for live tail)
     status: int
     rt: float           # request_time, sec
+    uht: float          # upstream_header_time (TTFB from backend), sec (-1 if absent)
     urt: float          # upstream_response_time, sec (-1 if absent)
+    cache: str          # normalized $upstream_cache_status ("" if unknown)
     uri: str
     ip: str
     bytes: int
@@ -58,6 +66,37 @@ def _to_float(v) -> float:
         return f if f >= 0 else -1.0
     except (TypeError, ValueError):
         return -1.0
+
+
+def _sum_times(v) -> float:
+    """Parse an nginx upstream time that may be multi-valued.
+
+    With several upstreams / internal redirects nginx writes e.g.
+    "0.01, 0.02 : 0.03"; the components are summed. Returns -1 when there
+    is no numeric value (absent, "-", or unparsable).
+    """
+    if v is None:
+        return -1.0
+    s = str(v).strip()
+    if not s or s == "-":
+        return -1.0
+    total = 0.0
+    found = False
+    for tok in re.split(r"[,:]", s):
+        tok = tok.strip()
+        if not tok or tok == "-":
+            continue
+        try:
+            total += float(tok)
+            found = True
+        except ValueError:
+            return -1.0
+    return total if found else -1.0
+
+
+def _norm_cache(v) -> str:
+    s = str(v or "").strip().upper()
+    return s if s in _CACHE_STATES else ""
 
 
 def parse_line(line: str, now: float) -> Optional[Event]:
@@ -74,7 +113,9 @@ def parse_line(line: str, now: float) -> Optional[Event]:
             t=now,
             status=int(d.get("status", 0) or 0),
             rt=_to_float(d.get("request_time")),
-            urt=_to_float(d.get("upstream_time", d.get("upstream_response_time"))),
+            uht=_sum_times(d.get("upstream_header_time")),
+            urt=_sum_times(d.get("upstream_time", d.get("upstream_response_time"))),
+            cache=_norm_cache(d.get("cache", d.get("upstream_cache_status", ""))),
             uri=str(d.get("uri", d.get("request", "?")))[:60],
             ip=str(d.get("remote_addr", "?")),
             bytes=int(d.get("bytes", d.get("body_bytes_sent", 0)) or 0),
@@ -84,7 +125,9 @@ def parse_line(line: str, now: float) -> Optional[Event]:
     if not m:
         return None
     rt_m = _RT.search(line)
+    uht_m = _UHT.search(line)
     urt_m = _URT.search(line)
+    cs_m = _CS.search(line)
     ip_m = _IP.match(line)
     # size — the number before "$http_referer", right after the status
     bytes_m = re.search(r'"\s+\d{3}\s+(\d+)', line)
@@ -92,7 +135,9 @@ def parse_line(line: str, now: float) -> Optional[Event]:
         t=now,
         status=int(m.group("status")),
         rt=_to_float(rt_m.group(1)) if rt_m else -1.0,
-        urt=_to_float(urt_m.group(1)) if urt_m else -1.0,
+        uht=_sum_times(uht_m.group(1)) if uht_m else -1.0,
+        urt=_sum_times(urt_m.group(1)) if urt_m else -1.0,
+        cache=_norm_cache(cs_m.group(1) if cs_m else ""),
         uri=m.group("uri")[:60],
         ip=ip_m.group(1) if ip_m else "?",
         bytes=int(bytes_m.group(1)) if bytes_m else 0,
@@ -164,6 +209,21 @@ class Window:
         f = int(k)
         c = min(f + 1, len(values) - 1)
         return values[f] + (values[c] - values[f]) * (k - f)
+
+    @staticmethod
+    def tail_mean(values: list[float], frac: float) -> float:
+        """Mean of the slowest `frac` fraction of values.
+
+        frac=0.01 -> average request_time of the worst 1%. Unlike a
+        percentile (a boundary value) this averages the whole tail beyond
+        that boundary, so it always sits at or above the matching pNN.
+        """
+        if not values:
+            return 0.0
+        values = sorted(values)
+        k = max(1, int(round(len(values) * frac)))
+        tail = values[-k:]
+        return sum(tail) / len(tail)
 
 
 # ───────────────────────── stub_status ─────────────────────────
@@ -295,6 +355,12 @@ def compute_stats(win: Window) -> dict:
     total = len(ev)
     rts = [e.rt for e in ev if e.rt >= 0]
     urts = [e.urt for e in ev if e.urt >= 0]
+    uhts = [e.uht for e in ev if e.uht >= 0]
+    hit_rts = [e.rt for e in ev if e.rt >= 0 and e.cache == "HIT"]
+    miss_rts = [e.rt for e in ev if e.rt >= 0 and e.cache in _MISS_STATES]
+    n_hit = sum(1 for e in ev if e.cache == "HIT")
+    n_miss = sum(1 for e in ev if e.cache in _MISS_STATES)
+    n_cache = n_hit + n_miss
     codes = Counter(e.status // 100 for e in ev)
     n5xx = codes.get(5, 0)
     n4xx = codes.get(4, 0)
@@ -305,8 +371,22 @@ def compute_stats(win: Window) -> dict:
         "p90": Window.pct(rts, 0.90),
         "p95": Window.pct(rts, 0.95),
         "p99": Window.pct(rts, 0.99),
+        "tail1": Window.tail_mean(rts, 0.01),
+        "tail5": Window.tail_mean(rts, 0.05),
+        "tail10": Window.tail_mean(rts, 0.10),
+        "tail50": Window.tail_mean(rts, 0.50),
         "u_p50": Window.pct(urts, 0.50),
         "u_p95": Window.pct(urts, 0.95),
+        "uht_p50": Window.pct(uhts, 0.50),
+        "uht_p95": Window.pct(uhts, 0.95),
+        "hit_p50": Window.pct(hit_rts, 0.50),
+        "hit_p95": Window.pct(hit_rts, 0.95),
+        "miss_p50": Window.pct(miss_rts, 0.50),
+        "miss_p95": Window.pct(miss_rts, 0.95),
+        "n_hit": n_hit,
+        "n_miss": n_miss,
+        "hit_ratio": 100 * n_hit / n_cache if n_cache else 0,
+        "cache_known": n_cache,
         "codes": codes,
         "pct5xx": 100 * n5xx / total if total else 0,
         "pct4xx": 100 * n4xx / total if total else 0,
@@ -335,12 +415,28 @@ def header_panel(stats: dict, stub: StubStatus, win: Window, interval: int) -> P
         (f"p95 {ms(stats['p95'])}  ", "yellow"),
         (f"p99 {ms(stats['p99'])}", "red" if stats["p99"] > 1 else "yellow"),
     )
+    tail = Text.assemble(
+        ("tail mean     ", "bold"),
+        (f"worst1% {ms(stats['tail1'])}  ", "red"),
+        (f"worst5% {ms(stats['tail5'])}  ", "yellow"),
+        (f"worst10% {ms(stats['tail10'])}  ", "yellow"),
+        (f"worst50% {ms(stats['tail50'])}", "white"),
+    )
     up = Text.assemble(
         ("upstream      ", "bold dim"),
-        (f"p50 {ms(stats['u_p50'])}  p95 {ms(stats['u_p95'])}", "dim"),
+        (f"ttfb p50 {ms(stats['uht_p50'])}  ", "dim"),
+        (f"resp p50 {ms(stats['u_p50'])}  p95 {ms(stats['u_p95'])}", "dim"),
     )
+    if stats["cache_known"]:
+        cache = Text.assemble(
+            ("cache         ", "bold"),
+            (f"HIT {stats['n_hit']} ({stats['hit_ratio']:.0f}%) p50 {ms(stats['hit_p50'])}  ", "green"),
+            (f"MISS {stats['n_miss']} p50 {ms(stats['miss_p50'])}", "yellow"),
+        )
+    else:
+        cache = Text("cache         no $upstream_cache_status in log", style="dim")
     sub = f"window {win.window}s · refresh {interval}s · traffic {human_bytes(stats['bytes'])}"
-    body = Group(t, rt, up)
+    body = Group(t, rt, tail, up, cache)
     return Panel(body, title="nginx monitor", subtitle=sub, border_style="cyan")
 
 
@@ -430,7 +526,7 @@ def alerts_panel(alerts: list[str]) -> Panel:
 def build_layout(stats, stub, sysm, alerts, win, interval) -> Layout:
     root = Layout()
     root.split_column(
-        Layout(header_panel(stats, stub, win, interval), size=8, name="head"),
+        Layout(header_panel(stats, stub, win, interval), size=10, name="head"),
         Layout(name="mid", size=12),
         Layout(stub_line(stub), size=1, name="stub"),
         Layout(sys_panel(sysm), size=5, name="sys"),
