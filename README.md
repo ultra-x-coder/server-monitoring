@@ -34,7 +34,7 @@ log_format perf '$remote_addr - $remote_user [$time_local] "$request" '
                 '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
                 'rt=$request_time uct=$upstream_connect_time '
                 'uht=$upstream_header_time urt=$upstream_response_time '
-                'cs=$upstream_cache_status';
+                'cs=$upstream_cache_status host=$host';
 access_log /usr/local/openresty/nginx/logs/access.log perf;
 ```
 
@@ -59,7 +59,8 @@ log_format json_perf escape=json '{'
   '"upstream_connect_time":"$upstream_connect_time",'
   '"upstream_header_time":"$upstream_header_time",'
   '"upstream_time":"$upstream_response_time",'
-  '"cache":"$upstream_cache_status"'
+  '"cache":"$upstream_cache_status",'
+  '"host":"$host"'
 '}';
 access_log /usr/local/openresty/nginx/logs/access.log json_perf;
 ```
@@ -88,6 +89,7 @@ The parser reads these keys (extra keys are kept in the log but ignored):
 | `upstream_header_time` | backend TTFB, seconds (shown as upstream `ttfb`) |
 | `upstream_time` / `upstream_response_time` | backend time, seconds |
 | `cache` / `upstream_cache_status` | `HIT`/`MISS`/… → cached vs uncached latency split |
+| `host` / `server_name` | request domain → "Latency by domain" breakdown |
 | `uri` / `request` | URL for "top slow URLs" grouping |
 | `remote_addr` | client IP |
 | `bytes` / `body_bytes_sent` | response size |

@@ -38,6 +38,7 @@ _RT = re.compile(r"\brt=(\d+\.?\d*)")
 _UHT = re.compile(r"\buht=([\d.,:-]+)")
 _URT = re.compile(r"\burt=([\d.,:-]+)")
 _CS = re.compile(r"\bcs=([A-Za-z]+)")
+_HOST = re.compile(r"\bhost=(\S+)")
 # combined part: "GET /path HTTP/1.1" 200 1234
 _REQ = re.compile(r'"(?P<method>[A-Z]+)\s+(?P<uri>[^ "?]+)[^"]*"\s+(?P<status>\d{3})')
 _IP = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})")
@@ -55,6 +56,7 @@ class Event:
     uht: float          # upstream_header_time (TTFB from backend), sec (-1 if absent)
     urt: float          # upstream_response_time, sec (-1 if absent)
     cache: str          # normalized $upstream_cache_status ("" if unknown)
+    host: str           # request domain ($host), "" if not logged
     uri: str
     ip: str
     bytes: int
@@ -116,6 +118,7 @@ def parse_line(line: str, now: float) -> Optional[Event]:
             uht=_sum_times(d.get("upstream_header_time")),
             urt=_sum_times(d.get("upstream_time", d.get("upstream_response_time"))),
             cache=_norm_cache(d.get("cache", d.get("upstream_cache_status", ""))),
+            host=str(d.get("host", d.get("server_name", "")) or "")[:40],
             uri=str(d.get("uri", d.get("request", "?")))[:60],
             ip=str(d.get("remote_addr", "?")),
             bytes=int(d.get("bytes", d.get("body_bytes_sent", 0)) or 0),
@@ -128,6 +131,7 @@ def parse_line(line: str, now: float) -> Optional[Event]:
     uht_m = _UHT.search(line)
     urt_m = _URT.search(line)
     cs_m = _CS.search(line)
+    host_m = _HOST.search(line)
     ip_m = _IP.match(line)
     # size — the number before "$http_referer", right after the status
     bytes_m = re.search(r'"\s+\d{3}\s+(\d+)', line)
@@ -138,6 +142,7 @@ def parse_line(line: str, now: float) -> Optional[Event]:
         uht=_sum_times(uht_m.group(1)) if uht_m else -1.0,
         urt=_sum_times(urt_m.group(1)) if urt_m else -1.0,
         cache=_norm_cache(cs_m.group(1) if cs_m else ""),
+        host=host_m.group(1)[:40] if host_m else "",
         uri=m.group("uri")[:60],
         ip=ip_m.group(1) if ip_m else "?",
         bytes=int(bytes_m.group(1)) if bytes_m else 0,
@@ -462,6 +467,34 @@ def slow_table(win: Window) -> Table:
     return t
 
 
+def domain_table(win: Window) -> Table:
+    """request_time percentiles broken down per request domain ($host)."""
+    agg: dict[str, list[float]] = {}
+    for e in win.events:
+        if e.rt >= 0 and e.host:
+            agg.setdefault(e.host, []).append(e.rt)
+    rows = sorted(agg.items(), key=lambda kv: len(kv[1]), reverse=True)[:8]
+    t = Table(expand=True)
+    t.add_column("domain", overflow="ellipsis", no_wrap=True)
+    t.add_column("n", justify="right")
+    t.add_column("p50", justify="right")
+    t.add_column("p95", justify="right")
+    t.add_column("p99", justify="right")
+    for host, v in rows:
+        p95 = Window.pct(v, 0.95)
+        c = "red" if p95 > 1 else "yellow" if p95 > 0.3 else "white"
+        t.add_row(
+            host,
+            str(len(v)),
+            ms(Window.pct(v, 0.50)),
+            Text(ms(p95), style=c),
+            ms(Window.pct(v, 0.99)),
+        )
+    if not rows:
+        t.add_row("(no $host in log)", "", "", "", "")
+    return t
+
+
 def status_table(stats: dict) -> Table:
     t = Table(title="Statuses", expand=True, title_style="bold")
     t.add_column("code", justify="left")
@@ -530,11 +563,19 @@ def build_layout(stats, stub, sysm, alerts, win, interval) -> Layout:
         Layout(name="mid", size=12),
         Layout(stub_line(stub), size=1, name="stub"),
         Layout(sys_panel(sysm), size=5, name="sys"),
-        Layout(alerts_panel(alerts), name="alerts"),
+        Layout(name="bottom"),
     )
     root["mid"].split_row(
         Layout(slow_table(win), name="slow"),
         Layout(status_table(stats), name="codes", ratio=1),
+    )
+    # carve the former Alerts area into "Latency by domain" + Alerts
+    root["bottom"].split_row(
+        Layout(
+            Panel(domain_table(win), title="Latency by domain", border_style="magenta"),
+            name="domains",
+        ),
+        Layout(alerts_panel(alerts), name="alerts"),
     )
     return root
 

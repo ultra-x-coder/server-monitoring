@@ -32,7 +32,7 @@ log_format perf '$remote_addr - $remote_user [$time_local] "$request" '
                 '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
                 'rt=$request_time uct=$upstream_connect_time '
                 'uht=$upstream_header_time urt=$upstream_response_time '
-                'cs=$upstream_cache_status';
+                'cs=$upstream_cache_status host=$host';
 access_log /usr/local/openresty/nginx/logs/access.log perf;
 ```
 
@@ -57,7 +57,8 @@ log_format json_perf escape=json '{'
   '"upstream_connect_time":"$upstream_connect_time",'
   '"upstream_header_time":"$upstream_header_time",'
   '"upstream_time":"$upstream_response_time",'
-  '"cache":"$upstream_cache_status"'
+  '"cache":"$upstream_cache_status",'
+  '"host":"$host"'
 '}';
 access_log /usr/local/openresty/nginx/logs/access.log json_perf;
 ```
@@ -66,6 +67,8 @@ access_log /usr/local/openresty/nginx/logs/access.log json_perf;
 серверная метрика, не зависящая от сети до клиента/VPN. `upstream_cache_status`
 (`HIT`/`MISS`/`BYPASS`/…) позволяет монитору разбить latency на отдачу из кэша и
 мимо него; без `proxy_cache` поле всегда `-` и строка cache в шапке скрывается.
+`host` (`$host`) даёт разбивку перцентилей `request_time` по доменам — блок
+«Latency by domain» внизу.
 Перцентили считаются по `request_time`; апстрим-времена с несколькими серверами
 (`0.01, 0.02 : 0.03`) суммируются.
 
